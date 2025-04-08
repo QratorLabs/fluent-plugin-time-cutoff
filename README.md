@@ -38,6 +38,5 @@ You can copy and paste generated documents here.
 
 ## Copyright
 
-* Copyright(c) 2025 Serge Tkatchouk
-* License
-  * 
+* Copyright(c) 2025 Qrator Labs and Serge Tkatchouk
+* License: MIT
