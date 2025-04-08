@@ -1,7 +1,7 @@
 PATH
-  remote: fluent-plugin-time-cutoff
+  remote: vendor/fluent-plugin-time-cutoff
   specs:
-    fluent-plugin-time-cutoff (0.1.0)
+    fluent-plugin-time-cutoff (0.1.1)
       fluentd (>= 0.14.10, < 2)
 
 GEM
