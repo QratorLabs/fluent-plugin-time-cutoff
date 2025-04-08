@@ -44,7 +44,7 @@ module Fluent
       #  (for action = :replace_timestamp):
       config_param :source_time_key, :string, default: 'source_time'
       ## How to format the original time (for action = :replace_timestamp):
-      config_param :source_time_format, :enum, list: TIME_FORMATS, default: :as_string
+      config_param :source_time_format, :enum, list: TIME_FORMATS, default: :iso8601
 
       def filter_with_time(tag, time, record)
         event_time = time.to_i
