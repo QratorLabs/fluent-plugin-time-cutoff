@@ -1,0 +1,6 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+gem 'fluentd', '~> 1.18'
+gem 'fluent-plugin-time-cutoff', path: 'vendor/fluent-plugin-time-cutoff'
