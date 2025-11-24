@@ -115,6 +115,22 @@ module Fluent
         log.warn log_line
       end
 
+      # Normalize time to Fluent::EventTime if it's plain int or float.
+      # @param time [Integer|Float] incoming event time
+      # @return [Fluent::EventTime] event time normalized to Fluentd's internal format
+      def normalize_time(time)
+        case time.class
+        when Integer
+          Fluent::EventTime.new(time)
+        when Float
+          time_int, time_frac = time.divmod(1)
+          Fluent::EventTime.new(time_int, (time_frac * 10**9).to_i)
+        else
+          log.warn "Unknown time format given: \"#{time.inspect}\"."
+          Fluent::EventTime.new(time.to_i) || Fluent::EventTime.now
+        end
+      end
+
       # Process the record according to its determined "age"
       # @param tag [String] log/stream's tag name
       # @param time [Fluent::EventTime] the original event time
@@ -123,6 +139,9 @@ module Fluent
       # @param action [Symbol] determined action for this record
       # @param age [Symbol] detemined age for this record (:old or :new)
       def process_record(tag, time, record, do_log, action, age) # rubocop:disable Metrics/ParameterLists
+        ## Safeguard against rogue integer time.
+        time = normalize_time(time) unless time.is_a?(Fluent::EventTime)
+
         log_record(tag, time, record, action, age) if do_log
 
         case action
