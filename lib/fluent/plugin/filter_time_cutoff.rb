@@ -82,7 +82,10 @@ module Fluent
         when :epoch_float
           time.to_f
         when :iso8601
-          time.to_time.strftime(TIME_ISO8601)
+          # NOTE: Time.at(int) is used instead of EventTime#to_time, which was
+          # only added to Fluentd in v1.8.0. This keeps us compatible with the
+          # older Fluentd releases declared in the gemspec.
+          Time.at(time.to_i).strftime(TIME_ISO8601)
         end
       end
 
