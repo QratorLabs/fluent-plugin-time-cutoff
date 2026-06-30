@@ -119,15 +119,31 @@ module Fluent
       # @param time [Integer|Float] incoming event time
       # @return [Fluent::EventTime] event time normalized to Fluentd's internal format
       def normalize_time(time)
-        case time.class
+        case time
         when Integer
           Fluent::EventTime.new(time)
         when Float
           time_int, time_frac = time.divmod(1)
           Fluent::EventTime.new(time_int, (time_frac * 10**9).to_i)
         else
-          log.warn "Unknown time format given: \"#{time.inspect}\"."
-          Fluent::EventTime.new(time.to_i) || Fluent::EventTime.now
+          log.warn "Unknown time format given (#{time.class}): \"#{time.inspect}\"."
+          numeric = coerce_to_number(time)
+          numeric ? normalize_time(numeric) : Fluent::EventTime.now
+        end
+      end
+
+      # Try to coerce an arbitrary value into a number, or return nil.
+      # Uses begin/rescue rather than the Integer()/Float() "exception:"
+      # keyword (Ruby 2.6+) so the plugin keeps working on older Rubies.
+      # @param value the value to coerce
+      # @return [Integer,Float,nil] the parsed number, or nil if not numeric
+      def coerce_to_number(value)
+        Integer(value)
+      rescue ArgumentError, TypeError
+        begin
+          Float(value)
+        rescue ArgumentError, TypeError
+          nil
         end
       end
 
