@@ -5,7 +5,7 @@ $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
 
 Gem::Specification.new do |spec|
   spec.name    = 'fluent-plugin-time-cutoff'
-  spec.version = '0.1.3'
+  spec.version = '0.2.0'
   spec.authors = ['Qrator Labs', 'Serge Tkatchouk']
   spec.email   = ['devops@qrator.net', 'st@qrator.net']
 
