@@ -104,17 +104,17 @@ $ bundle
  
   old_cutoff 24h
   old_action pass
-  old_log true
+  old_log full
 
   new_cutoff 24h
   new_action pass
-  new_log true
+  new_log full
 
   source_time_key source_time
   source_time_format iso8601
 
   bad_time_action replace_timestamp
-  bad_time_log true
+  bad_time_log full
   bad_time_key source_time_raw
 
   time_key_conflict skip
@@ -138,11 +138,15 @@ Available values: pass, replace_timestamp, drop
 
 Default value: `pass`.
 
-### old_log (bool) (optional)
+### old_log (enum) (optional)
 
-Log the "old" messages to Fluentd's own log. Defaults to "true".
+Log the "old" messages to Fluentd's own log. Defaults to "full".
 
-Default value: `true`.
+Available values: none (or false/no), metadata, full (or true/yes)
+
+See [Logging](#logging) for what each mode logs.
+
+Default value: `full`.
 
 ### new_cutoff (time) (optional)
 
@@ -160,11 +164,15 @@ Available values: pass, replace_timestamp, drop
 
 Default value: `pass`.
 
-### new_log (bool) (optional)
+### new_log (enum) (optional)
 
-Log the "new" messages to Fluentd's own log. Defaults to "true".
+Log the "new" messages to Fluentd's own log. Defaults to "full".
 
-Default value: `true`.
+Available values: none (or false/no), metadata, full (or true/yes)
+
+See [Logging](#logging) for what each mode logs.
+
+Default value: `full`.
 
 ### source_time_key (string) (optional)
 
@@ -186,17 +194,21 @@ Default value: `iso8601`.
 
 The action that will be performed to all messages with an unparseable time. Defaults to replacing it with current time.
 
-Event times that aren't a `Fluent::EventTime` are parsed before the age check. Integers, floats, numeric strings and ISO 8601 datetime strings are accepted. ISO 8601 strings may use a space instead of `T` and may have a space before the timezone (e.g. `2025-04-08 14:43:14 +0300` or `2025-04-08 11:43:14 UTC`, as produced by Ruby's `Time#to_s`). Strings without a timezone are treated as local time. Any other time is deemed unparseable and is handled according to this action (and logged, unless `bad_time_log` is disabled).
+Event times that aren't a `Fluent::EventTime` are parsed before the age check. Integers, floats, numeric strings and ISO 8601 datetime strings are accepted. ISO 8601 strings may use a space instead of `T` and may have a space before the timezone (e.g. `2025-04-08 14:43:14 +0300` or `2025-04-08 11:43:14 UTC`, as produced by Ruby's `Time#to_s`). Strings without a timezone are treated as local time. Any other time is deemed unparseable and is handled according to this action (and logged, unless `bad_time_log` is `none`).
 
 Available values: replace_timestamp, drop
 
 Default value: `replace_timestamp`.
 
-### bad_time_log (bool) (optional)
+### bad_time_log (enum) (optional)
 
-Log the messages with an unparseable time to Fluentd's own log. Defaults to "true".
+Log the messages with an unparseable time to Fluentd's own log. Defaults to "full".
 
-Default value: `true`.
+Available values: none (or false/no), metadata, full (or true/yes)
+
+See [Logging](#logging) for what each mode logs.
+
+Default value: `full`.
 
 ### bad_time_key (string) (optional)
 
@@ -215,12 +227,31 @@ The action that will be performed when the record already has source_time_key or
 This happens e.g. when a record passes through more than one `time_cutoff` filter, in which case the existing value is the true original time. The event time itself is replaced with current time in any case.
 
 * `skip`: keep the existing value.
-* `warn`: keep the existing value and log a warning to Fluentd's own log.
+* `warn`: keep the existing value and log a warning to Fluentd's own log. The warning is logged even if the record's log mode is `none`, but includes the record only in `full` mode.
 * `overwrite`: replace the existing value.
 
 Available values: skip, warn, overwrite
 
 Default value: `skip`.
+
+## Logging
+
+Each caught record is logged as a warning to Fluentd's own log, according to the `old_log`, `new_log` or `bad_time_log` mode:
+
+* `none` (or `false`/`no`): nothing is logged.
+* `metadata`: only the tag, the event time and its age (or the raw unparseable time) are logged, but not the record itself. Use it for records that may hold sensitive data, e.g. audit logs.
+* `full` (or `true`/`yes`): the whole record is logged as well.
+
+```
+# metadata
+[warn]: [time_cutoff] Record caught [old, drop]: "vault.audit: 2025-04-07T14:43:24+03:00 (age 1d 0h 0m 0s)".
+[warn]: [time_cutoff] Record caught [new, pass]: "vault.audit: 2025-04-08T16:43:29+03:00 (age -2h 0m 5s)".
+[warn]: [time_cutoff] Record caught [bad_time, drop]: "vault.audit: "not-a-time"".
+
+# full
+[warn]: [time_cutoff] Record caught [old, drop]: "vault.audit: 2025-04-07T14:43:24+03:00 {"message":"hello"}".
+[warn]: [time_cutoff] Record caught [bad_time, drop]: "vault.audit: "not-a-time" {"message":"hello"}".
+```
 
 ## Copyright
 

@@ -50,6 +50,25 @@ module Fluent
         :overwrite
       ].freeze
 
+      # Available log modes for caught records.
+      LOG_MODES = [
+        # Do not log:
+        :none,
+        # Log tag, time and age (or the raw unparseable time) only:
+        :metadata,
+        # Log the whole record:
+        :full,
+        # Aliases for :none and :full, kept for compatibility with the
+        # boolean *_log options of earlier versions:
+        :false,
+        :no,
+        :true,
+        :yes
+      ].freeze
+
+      # Log modes the boolean aliases stand for.
+      LOG_MODE_ALIASES = { false: :none, no: :none, true: :full, yes: :full }.freeze
+
       # strftime() format string for :iso8601 time format.
       TIME_ISO8601 = '%FT%T%:z'
 
@@ -72,22 +91,22 @@ module Fluent
       config_param :old_cutoff, :time, default: 86_400 # 24 hours
       desc 'The action that will be performed to all "old" messages. Defaults to passthrough.'
       config_param :old_action, :enum, list: CUTOFF_ACTIONS, default: :pass
-      desc 'Log the "old" messages to Fluentd\'s own log. Defaults to "true".'
-      config_param :old_log, :bool, default: true
+      desc 'Log the "old" messages to Fluentd\'s own log: none (false/no), metadata or full (true/yes). Defaults to "full".'
+      config_param :old_log, :enum, list: LOG_MODES, default: :full
       desc 'Records newer than this amount of time are deemed "new". Defaults to 24 hours.'
       config_param :new_cutoff, :time, default: 86_400 # 24 hours
       desc 'The action that will be performed to all "new" messages. Defaults to passthrough.'
       config_param :new_action, :enum, list: CUTOFF_ACTIONS, default: :pass
-      desc 'Log the "new" messages to Fluentd\'s own log. Defaults to "true".'
-      config_param :new_log, :bool, default: true
+      desc 'Log the "new" messages to Fluentd\'s own log: none (false/no), metadata or full (true/yes). Defaults to "full".'
+      config_param :new_log, :enum, list: LOG_MODES, default: :full
       desc 'The key that will hold the original time (for :replace_timestamp action). Defaults to "source_time".'
       config_param :source_time_key, :string, default: 'source_time'
       desc 'Time format for the original timestamp field. Defaults to ISO8601-formatted string.'
       config_param :source_time_format, :enum, list: TIME_FORMATS, default: :iso8601
       desc 'The action that will be performed to all messages with an unparseable time. Defaults to replacing it with current time.'
       config_param :bad_time_action, :enum, list: BAD_TIME_ACTIONS, default: :replace_timestamp
-      desc 'Log the messages with an unparseable time to Fluentd\'s own log. Defaults to "true".'
-      config_param :bad_time_log, :bool, default: true
+      desc 'Log the messages with an unparseable time to Fluentd\'s own log: none (false/no), metadata or full (true/yes). Defaults to "full".'
+      config_param :bad_time_log, :enum, list: LOG_MODES, default: :full
       desc 'The key that will hold the original unparseable time (for :replace_timestamp action). Defaults to "source_time_raw".'
       config_param :bad_time_key, :string, default: 'source_time_raw'
       desc 'The action that will be performed when the record already has source_time_key or bad_time_key. Defaults to keeping the existing value.'
@@ -107,9 +126,15 @@ module Fluent
         %i[source_time_key bad_time_key].each do |param|
           raise Fluent::ConfigError, "#{param} must not be empty" if instance_variable_get("@#{param}").empty?
         end
-        return unless @source_time_key == @bad_time_key
+        if @source_time_key == @bad_time_key
+          raise Fluent::ConfigError, "source_time_key and bad_time_key must differ, both are \"#{@source_time_key}\""
+        end
 
-        raise Fluent::ConfigError, "source_time_key and bad_time_key must differ, both are \"#{@source_time_key}\""
+        %i[old_log new_log bad_time_log].each do |param|
+          mode = instance_variable_get("@#{param}")
+          instance_variable_set("@#{param}", LOG_MODE_ALIASES.fetch(mode, mode))
+        end
+
       end
 
       def filter_with_time(tag, time, record)
@@ -176,10 +201,11 @@ module Fluent
       # @param tag [String] log/stream's tag name
       # @param time [Fluent::EventTime] the original event time
       # @param record [Hash] the original record contents
+      # @param log_mode [Symbol] log mode for this record
       # @param @source_time_key [String] name of the field to put the old timestamp to.
       # @return [Array] new event time and a modified record.
-      def do_replace_timestamp(tag, time, record)
-        [Fluent::EventTime.now, put_time_key(tag, record, @source_time_key, format_time(time))]
+      def do_replace_timestamp(tag, time, record, log_mode)
+        [Fluent::EventTime.now, put_time_key(tag, record, @source_time_key, format_time(time), log_mode)]
       end
 
       # Put the original time into the given field of a copy of the record,
@@ -189,10 +215,11 @@ module Fluent
       # @param record [Hash] the original record contents
       # @param key [String] name of the field to put the time to
       # @param value the time value to put into the field
+      # @param log_mode [Symbol] log mode for this record
       # @return [Hash] the modified copy of the record, or the original record if kept as is
-      def put_time_key(tag, record, key, value)
+      def put_time_key(tag, record, key, value, log_mode) # rubocop:disable Metrics/ParameterLists
         if record.key?(key) && @time_key_conflict != :overwrite
-          log_time_key_conflict(tag, record, key, value) if @time_key_conflict == :warn
+          log_time_key_conflict(tag, record, key, value, log_mode) if @time_key_conflict == :warn
           return record
         end
 
@@ -201,44 +228,57 @@ module Fluent
         new_record
       end
 
-      # Log a time key conflict to Fluentd's log.
+      # Log a time key conflict to Fluentd's log. It is logged even if the
+      # record's log mode is :none, since it was asked for explicitly, but the
+      # record itself is only included in :full mode.
       # @param tag [String] log/stream's tag name
       # @param record [Hash] the original record contents
       # @param key [String] name of the conflicting field
       # @param value the time value that was not put into the field
-      def log_time_key_conflict(tag, record, key, value)
-        log_line = format(
-          'Record already has the "%<key>s" key, keeping its existing value instead of %<val>s: "%<tag>s: %<msg>s".',
-          key: key, val: value.inspect, tag: tag, msg: dump_record(record)
+      # @param log_mode [Symbol] log mode for this record
+      def log_time_key_conflict(tag, record, key, value, log_mode) # rubocop:disable Metrics/ParameterLists
+        subject = log_mode == :full ? "#{tag}: #{dump_record(record)}" : tag
+        log.warn format(
+          'Record already has the "%<key>s" key, keeping its existing value instead of %<val>s: "%<subject>s".',
+          key: key, val: value.inspect, subject: subject
         )
-        log.warn log_line
       end
 
       # Log the caught event to Fluentd's log.
       # @param tag [String] log/stream's tag name
-      # @param time [Fluent::EventTime] the original event time
+      # @param time [Fluent::EventTime] the original event time, or the raw
+      #   time for :bad_time records
       # @param record [Hash] the original record contents
       # @param action [Symbol] determined action for this record
-      # @param age [Symbol] detemined age for this record (:old or :new)
-      def log_record(tag, time, record, action, age)
-        log_line = format(
-          'Record caught [%<age>s, %<act>s]: "%<tag>s: %<time>s %<msg>s".',
-          age: age, act: action, tag: tag, time: iso8601(time), msg: dump_record(record)
+      # @param reason [Symbol] why the record was caught (:old, :new or :bad_time)
+      # @param log_mode [Symbol] :none, :metadata (no record contents) or :full
+      def log_record(tag, time, record, action, reason, log_mode) # rubocop:disable Metrics/ParameterLists
+        return if log_mode == :none
+
+        details = reason == :bad_time ? time.inspect : iso8601(time)
+        if log_mode == :full
+          details = "#{details} #{dump_record(record)}"
+        elsif reason != :bad_time
+          details = "#{details} (age #{format_age(current_time - time.to_i)})"
+        end
+        log.warn format(
+          'Record caught [%<reason>s, %<act>s]: "%<tag>s: %<details>s".',
+          reason: reason, act: action, tag: tag, details: details
         )
-        log.warn log_line
       end
 
-      # Log the caught event with an unparseable time to Fluentd's log.
-      # @param tag [String] log/stream's tag name
-      # @param time the original (unparseable) event time
-      # @param record [Hash] the original record contents
-      # @param action [Symbol] determined action for this record
-      def log_bad_time_record(tag, time, record, action)
-        log_line = format(
-          'Record caught [unparseable, %<act>s]: "%<tag>s: %<time>s %<msg>s".',
-          act: action, tag: tag, time: time.inspect, msg: dump_record(record)
-        )
-        log.warn log_line
+      # Format an age in seconds as a compact human-readable string, e.g.
+      # "1d 2h 3m 4s", "5m 0s" or "-2h 0m 5s" for times in the future.
+      # @param seconds [Integer] the age in seconds
+      # @return [String] the formatted age
+      def format_age(seconds)
+        rest = seconds.abs
+        parts = [[86_400, 'd'], [3600, 'h'], [60, 'm'], [1, 's']].map do |size, unit|
+          value, rest = rest.divmod(size)
+          "#{value}#{unit}"
+        end
+        parts.shift while parts.size > 1 && parts.first.start_with?('0')
+        "#{'-' if seconds.negative?}#{parts.join(' ')}"
       end
 
       # Serialize the record for logging. Falls back to #inspect when the
@@ -304,17 +344,18 @@ module Fluent
       # @param tag [String] log/stream's tag name
       # @param time [Fluent::EventTime] the original event time
       # @param record [Hash] the original record contents
-      # @param do_log [Boolean] should we log this record or not
+      # @param log_mode [Symbol] log mode for this record
       # @param action [Symbol] determined action for this record
-      # @param age [Symbol] detemined age for this record (:old or :new)
-      def process_record(tag, time, record, do_log, action, age) # rubocop:disable Metrics/ParameterLists
-        log_record(tag, time, record, action, age) if do_log
+      # @param reason [Symbol] why the record was caught (:old or :new)
+      def process_record(tag, time, record, log_mode, action, reason) # rubocop:disable Metrics/ParameterLists
+        count_record(tag, reason, action)
+        log_record(tag, time, record, action, reason, log_mode)
 
         case action
         when :pass
           [time, record]
         when :replace_timestamp
-          do_replace_timestamp(tag, time, record)
+          do_replace_timestamp(tag, time, record, log_mode)
         when :drop
           nil
         end
@@ -326,7 +367,8 @@ module Fluent
       # @param record [Hash] the original record contents
       # @return [Array,nil] current time and the record, or nil if dropped.
       def process_bad_time_record(tag, time, record)
-        log_bad_time_record(tag, time, record, @bad_time_action) if @bad_time_log
+        count_record(tag, :bad_time, @bad_time_action)
+        log_record(tag, time, record, @bad_time_action, :bad_time, @bad_time_log)
 
         case @bad_time_action
         when :replace_timestamp
@@ -347,7 +389,7 @@ module Fluent
       # @return [Array] new event time and a modified record.
       def do_replace_bad_timestamp(tag, time, record)
         raw_time = time.is_a?(String) ? time : time.inspect
-        [Fluent::EventTime.now, put_time_key(tag, record, @bad_time_key, raw_time)]
+        [Fluent::EventTime.now, put_time_key(tag, record, @bad_time_key, raw_time, @bad_time_log)]
       end
 
       # Process the "old" record according to the configuration

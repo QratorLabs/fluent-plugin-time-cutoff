@@ -18,14 +18,37 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
       assert_equal 86_400, d.instance.new_cutoff
       assert_equal :pass, d.instance.old_action
       assert_equal :pass, d.instance.new_action
-      assert_true d.instance.old_log
-      assert_true d.instance.new_log
+      assert_equal :full, d.instance.old_log
+      assert_equal :full, d.instance.new_log
       assert_equal 'source_time', d.instance.source_time_key
       assert_equal :iso8601, d.instance.source_time_format
       assert_equal :replace_timestamp, d.instance.bad_time_action
-      assert_true d.instance.bad_time_log
+      assert_equal :full, d.instance.bad_time_log
       assert_equal 'source_time_raw', d.instance.bad_time_key
       assert_equal :skip, d.instance.time_key_conflict
+      assert_false d.instance.metrics
+    end
+
+    data(
+      'false' => ['false', :none],
+      'no' => ['no', :none],
+      'none' => ['none', :none],
+      'metadata' => ['metadata', :metadata],
+      'full' => ['full', :full],
+      'true' => ['true', :full],
+      'yes' => ['yes', :full]
+    )
+    test 'log options accept log modes and boolean aliases' do |(value, mode)|
+      d = create_driver("old_log #{value}\nnew_log #{value}\nbad_time_log #{value}")
+      assert_equal mode, d.instance.old_log
+      assert_equal mode, d.instance.new_log
+      assert_equal mode, d.instance.bad_time_log
+    end
+
+    test 'rejects unknown log modes' do
+      assert_raise(Fluent::ConfigError) do
+        create_driver('old_log verbose')
+      end
     end
 
     test 'parses human-readable durations' do
@@ -220,7 +243,7 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
       assert_in_delta Time.now.to_i, d.filtered_time.first.sec, 5
       warnings = d.logs.select { |l| l.include?('[warn]') }
       assert_equal 1, warnings.size
-      assert_match(/\[unparseable, replace_timestamp\].*"not-a-time"/, warnings.first)
+      assert_match(/\[bad_time, replace_timestamp\].*"not-a-time"/, warnings.first)
     end
 
     test 'unparseable time is replaced with now when configured explicitly' do
@@ -272,7 +295,7 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
       assert_empty d.error_events
       warnings = d.logs.select { |l| l.include?('[warn]') }
       assert_equal 1, warnings.size
-      assert_match(/\[unparseable, drop\].*"not-a-time"/, warnings.first)
+      assert_match(/\[bad_time, drop\].*"not-a-time"/, warnings.first)
       assert_match(/test\.cutoff/, warnings.first)
       assert_match(/\{"message":"hello"\}/, warnings.first)
     end
@@ -388,6 +411,66 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
       d = filter("old_action pass\nold_log false", ago(100_000))
       assert_false(d.logs.any? { |l| l.include?('Record caught') })
     end
+
+    test 'logging is skipped with log mode none' do
+      d = filter("new_action pass\nnew_log none", ahead(100_000))
+      assert_false(d.logs.any? { |l| l.include?('Record caught') })
+    end
+
+    def caught(driver)
+      driver.logs.select { |l| l.include?('Record caught') }
+    end
+
+    test 'metadata mode logs tag, time and age without the record' do
+      d = filter("old_cutoff 1h\nold_action drop\nold_log metadata", at(NOW - 93_784), now: NOW)
+      lines = caught(d)
+      assert_equal 1, lines.size
+      assert_match(/\[old, drop\]: "test\.cutoff: #{Regexp.escape(Time.at(NOW - 93_784).strftime('%FT%T%:z'))} \(age 1d 2h 3m 4s\)"\./, lines.first)
+      assert_not_match(/hello/, lines.first)
+    end
+
+    test 'metadata mode shows a negative age for records from the future' do
+      d = filter("new_cutoff 1h\nnew_action pass\nnew_log metadata", at(NOW + 7_205), now: NOW)
+      assert_match(/\[new, pass\]: "test\.cutoff: \S+ \(age -2h 0m 5s\)"\./, caught(d).first)
+    end
+
+    data(
+      'seconds' => [59, '59s'],
+      'zero' => [0, '0s'],
+      'minutes' => [60, '1m 0s'],
+      'days' => [86_400 * 400, '400d 0h 0m 0s']
+    )
+    test 'formats ages compactly' do |(seconds, text)|
+      assert_equal text, create_driver('').instance.send(:format_age, seconds)
+    end
+
+    test 'metadata mode logs the raw bad time without the record' do
+      d = filter("bad_time_action drop\nbad_time_log metadata", 'not-a-time')
+      lines = caught(d)
+      assert_equal 1, lines.size
+      assert_match(/\[bad_time, drop\]: "test\.cutoff: "not-a-time""\./, lines.first)
+      assert_not_match(/hello/, lines.first)
+    end
+
+    test 'full mode still logs the record' do
+      d = filter("bad_time_action drop\nbad_time_log full", 'not-a-time')
+      assert_match(/\[bad_time, drop\]: "test\.cutoff: "not-a-time" \{"message":"hello"\}"\./, caught(d).first)
+    end
+
+    data(
+      'full' => ['full', true],
+      'metadata' => ['metadata', false],
+      'none' => ['none', false]
+    )
+    test 'time key conflict warnings follow the log mode' do |(mode, with_record)|
+      record = { 'message' => 'hello', 'source_time' => 'earlier' }
+      d = filter("old_action replace_timestamp\nold_log #{mode}\ntime_key_conflict warn", ago(100_000), record)
+      warning = d.logs.grep(/already has the "source_time" key/)
+      assert_equal 1, warning.size
+      assert_equal with_record, warning.first.include?('hello')
+    end
+  end
+
   end
 
   sub_test_case 'source_time_format' do
