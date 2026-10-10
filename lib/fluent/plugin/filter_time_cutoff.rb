@@ -54,6 +54,10 @@ module Fluent
       config_param :source_time_format, :enum, list: TIME_FORMATS, default: :iso8601
 
       def filter_with_time(tag, time, record)
+        ## Safeguard against rogue integer/float/string time. This has to happen
+        ## before classification, so that the age check uses the parsed value.
+        time = normalize_time(time) unless time.is_a?(Fluent::EventTime)
+
         event_time = time.to_i
         current_time = Time.now.to_i
 
@@ -163,9 +167,6 @@ module Fluent
       # @param action [Symbol] determined action for this record
       # @param age [Symbol] detemined age for this record (:old or :new)
       def process_record(tag, time, record, do_log, action, age) # rubocop:disable Metrics/ParameterLists
-        ## Safeguard against rogue integer time.
-        time = normalize_time(time) unless time.is_a?(Fluent::EventTime)
-
         log_record(tag, time, record, action, age) if do_log
 
         case action

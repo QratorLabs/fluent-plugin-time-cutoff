@@ -98,6 +98,47 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
     end
   end
 
+  sub_test_case 'non-EventTime input' do
+    test 'raw integer time inside the window is normalized to EventTime' do
+      t = Time.now.to_i - 3600
+      d = filter("old_action drop\nnew_action drop", t)
+      assert_equal [RECORD], d.filtered_records
+      assert_kind_of Fluent::EventTime, d.filtered_time.first
+      assert_equal t, d.filtered_time.first.sec
+    end
+
+    test 'raw integer time past the cutoff is detected' do
+      d = filter('old_action drop', Time.now.to_i - 100_000)
+      assert_empty d.filtered_records
+    end
+
+    test 'raw float time inside the window keeps sub-second precision' do
+      t = Time.now.to_i - 3600
+      d = filter('old_action drop', t + 0.5)
+      assert_equal t, d.filtered_time.first.sec
+      assert_in_delta 500_000_000, d.filtered_time.first.nsec, 1
+    end
+
+    test 'string time is classified by its parsed value, not String#to_i' do
+      # "1.79e+09".to_i == 1, which used to look like a 1970 timestamp.
+      t = Time.now.to_i - 3600
+      d = filter('old_action drop', format('%.10e', t))
+      assert_equal [RECORD], d.filtered_records
+      assert_equal t, d.filtered_time.first.sec
+    end
+
+    test 'string time past the cutoff is detected' do
+      d = filter('old_action drop', (Time.now.to_i - 100_000).to_s)
+      assert_empty d.filtered_records
+    end
+
+    test 'unparseable time is replaced with now and kept' do
+      d = filter('old_action drop', 'not-a-time')
+      assert_equal [RECORD], d.filtered_records
+      assert_in_delta Time.now.to_i, d.filtered_time.first.sec, 5
+    end
+  end
+
   sub_test_case 'logging' do
     test 'logs caught records as JSON' do
       d = filter('old_action pass', ago(100_000))
@@ -203,10 +244,12 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
   private
 
   # Feed a single record at the given time through a configured driver.
+  # Events are fed as an array so that non-EventTime times (Float, String,
+  # nil) reach the plugin as-is.
   def filter(conf, time, record = RECORD)
     d = create_driver(conf)
     d.run(default_tag: 'test.cutoff') do
-      d.feed(time, record)
+      d.feed([[time, record]])
     end
     d
   end
