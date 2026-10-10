@@ -8,6 +8,9 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
 
   RECORD = { 'message' => 'hello' }.freeze
 
+  # A fixed "current time" for tests that need a frozen clock.
+  NOW = 1_700_000_000
+
   sub_test_case 'configuration' do
     test 'loads sane defaults' do
       d = create_driver('')
@@ -22,6 +25,7 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
       assert_equal :replace_timestamp, d.instance.bad_time_action
       assert_true d.instance.bad_time_log
       assert_equal 'source_time_raw', d.instance.bad_time_key
+      assert_equal :skip, d.instance.time_key_conflict
     end
 
     test 'parses human-readable durations' do
@@ -41,6 +45,33 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
       end
     end
 
+    data(
+      'negative old_cutoff' => 'old_cutoff -3600',
+      'negative new_cutoff' => 'new_cutoff -1',
+      'negative cutoff with a unit' => 'old_cutoff -1h',
+      'negative cutoff with leading spaces' => 'new_cutoff "  -1h"',
+      'empty source_time_key' => 'source_time_key ""',
+      'empty bad_time_key' => 'bad_time_key ""',
+      'same keys' => "source_time_key t\nbad_time_key t"
+    )
+    test 'rejects invalid settings' do |conf|
+      assert_raise(Fluent::ConfigError) do
+        create_driver(conf)
+      end
+    end
+
+    test 'accepts zero cutoffs' do
+      d = create_driver("old_cutoff 0\nnew_cutoff 0")
+      assert_equal 0, d.instance.old_cutoff
+      assert_equal 0, d.instance.new_cutoff
+    end
+
+    test 'rejects unknown time key conflict actions' do
+      assert_raise(Fluent::ConfigError) do
+        create_driver('time_key_conflict merge')
+      end
+    end
+
     test 'rejects unknown unparseable time actions' do
       assert_raise(Fluent::ConfigError) do
         create_driver('bad_time_action pass')
@@ -54,9 +85,32 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
       assert_equal [RECORD], d.filtered_records
     end
 
-    test 'records exactly at the cutoff edge are kept' do
+    # The clock is frozen for the exact-edge tests below, so that a second
+    # boundary passing between feeding the record and checking it can't
+    # make them flaky.
+    test 'records exactly at the old cutoff edge are kept' do
       # event_time == now - old_cutoff is NOT "< now - old_cutoff", so it stays.
-      d = filter("old_cutoff 1h\nold_action drop", ago(3600))
+      d = filter("old_cutoff 1h\nold_action drop", at(NOW - 3600), now: NOW)
+      assert_equal [RECORD], d.filtered_records
+    end
+
+    test 'records one second past the old cutoff edge are caught' do
+      d = filter("old_cutoff 1h\nold_action drop", at(NOW - 3601), now: NOW)
+      assert_empty d.filtered_records
+    end
+
+    test 'records exactly at the new cutoff edge are kept' do
+      d = filter("new_cutoff 1h\nnew_action drop", at(NOW + 3600), now: NOW)
+      assert_equal [RECORD], d.filtered_records
+    end
+
+    test 'records one second past the new cutoff edge are caught' do
+      d = filter("new_cutoff 1h\nnew_action drop", at(NOW + 3601), now: NOW)
+      assert_empty d.filtered_records
+    end
+
+    test 'sub-second precision does not move the edge' do
+      d = filter("old_cutoff 1h\nold_action drop", Fluent::EventTime.new(NOW - 3600, 999_999_999), now: NOW)
       assert_equal [RECORD], d.filtered_records
     end
 
@@ -246,6 +300,76 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
     end
   end
 
+  sub_test_case 'time_key_conflict' do
+    # Old records get their time replaced and the original put into
+    # source_time_key; records with a bad time get the raw time put into
+    # bad_time_key. Both keys already exist in these records.
+    EXISTING = { 'message' => 'hello', 'source_time' => 'earlier', 'source_time_raw' => 'earlier raw' }.freeze
+
+    def old_record(conf)
+      filter("old_action replace_timestamp\nold_log false\n#{conf}", ago(100_000), EXISTING)
+    end
+
+    def bad_time_record(conf)
+      filter("bad_time_action replace_timestamp\nbad_time_log false\n#{conf}", 'not-a-time', EXISTING)
+    end
+
+    def warnings(driver)
+      driver.logs.select { |l| l.include?('[warn]') }
+    end
+
+    data('source_time_key' => [:old_record, 'source_time'],
+         'bad_time_key' => [:bad_time_record, 'source_time_raw'])
+    test 'skip keeps the existing value silently by default' do |(feed, key)|
+      d = send(feed, '')
+      new_time, record = d.filtered.first
+      assert_equal EXISTING[key], record[key]
+      assert_in_delta Time.now.to_i, new_time.to_i, 5
+      assert_empty warnings(d)
+    end
+
+    data('source_time_key' => [:old_record, 'source_time'],
+         'bad_time_key' => [:bad_time_record, 'source_time_raw'])
+    test 'warn keeps the existing value and logs a warning' do |(feed, key)|
+      d = send(feed, 'time_key_conflict warn')
+      new_time, record = d.filtered.first
+      assert_equal EXISTING[key], record[key]
+      assert_in_delta Time.now.to_i, new_time.to_i, 5
+      assert_equal 1, warnings(d).size
+      assert_match(/"#{key}" key/, warnings(d).first)
+      assert_match(/test\.cutoff/, warnings(d).first)
+    end
+
+    data('source_time_key' => [:old_record, 'source_time'],
+         'bad_time_key' => [:bad_time_record, 'source_time_raw'])
+    test 'overwrite replaces the existing value silently' do |(feed, key)|
+      d = send(feed, 'time_key_conflict overwrite')
+      record = d.filtered_records.first
+      assert_not_equal EXISTING[key], record[key]
+      assert_empty warnings(d)
+    end
+
+    test 'overwrite stores the formatted original time' do
+      t = ago(100_000)
+      d = filter("old_action replace_timestamp\ntime_key_conflict overwrite", t, EXISTING)
+      assert_equal Time.at(t.to_i).strftime('%FT%T%:z'), d.filtered_records.first['source_time']
+    end
+
+    test 'no conflict handling happens when the key is absent' do
+      d = filter("old_action replace_timestamp\nold_log false\ntime_key_conflict warn", ago(100_000))
+      assert_true d.filtered_records.first.key?('source_time')
+      assert_empty warnings(d)
+    end
+
+    test 'the input record is never mutated' do
+      %w[skip warn overwrite].each do |mode|
+        old_record("time_key_conflict #{mode}")
+        bad_time_record("time_key_conflict #{mode}")
+      end
+      assert_equal({ 'message' => 'hello', 'source_time' => 'earlier', 'source_time_raw' => 'earlier raw' }, EXISTING)
+    end
+  end
+
   sub_test_case 'logging' do
     test 'logs caught records as JSON' do
       d = filter('old_action pass', ago(100_000))
@@ -413,12 +537,18 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
   # Feed a single record at the given time through a configured driver.
   # Events are fed as an array so that non-EventTime times (Float, String,
   # nil) reach the plugin as-is.
-  def filter(conf, time, record = RECORD)
+  # Pass "now:" to freeze the plugin's clock at that UNIX time.
+  def filter(conf, time, record = RECORD, now: nil)
     d = create_driver(conf)
+    d.instance.define_singleton_method(:current_time) { now } if now
     d.run(default_tag: 'test.cutoff') do
       d.feed([[time, record]])
     end
     d
+  end
+
+  def at(seconds)
+    Fluent::EventTime.new(seconds)
   end
 
   def ago(seconds)

@@ -116,6 +116,8 @@ $ bundle
   bad_time_action replace_timestamp
   bad_time_log true
   bad_time_key source_time_raw
+
+  time_key_conflict skip
 </filter>
 
 ```
@@ -123,6 +125,8 @@ $ bundle
 ### old_cutoff (time) (optional)
 
 Records older than this amount of time are deemed "old". Defaults to 24 hours.
+
+Must not be negative.
 
 Default value: `86400`.
 
@@ -144,6 +148,8 @@ Default value: `true`.
 
 Records newer than this amount of time are deemed "new". Defaults to 24 hours.
 
+Must not be negative.
+
 Default value: `86400`.
 
 ### new_action (enum) (optional)
@@ -163,6 +169,8 @@ Default value: `true`.
 ### source_time_key (string) (optional)
 
 The key that will hold the original time (for :replace_timestamp action). Defaults to "source_time".
+
+Must not be empty or equal to `bad_time_key`.
 
 Default value: `source_time`.
 
@@ -194,9 +202,25 @@ Default value: `true`.
 
 The key that will hold the original unparseable time (for :replace_timestamp action). Defaults to "source_time_raw".
 
+Must not be empty or equal to `source_time_key`.
+
 The original time is stored as is if it's a string, or as its Ruby `#inspect` representation otherwise (e.g. `nil`), so this field always holds a string. It is kept separate from `source_time_key`, so that `source_time_key` always holds a value in `source_time_format` and doesn't cause type conflicts in downstream storage.
 
 Default value: `source_time_raw`.
+
+### time_key_conflict (enum) (optional)
+
+The action that will be performed when the record already has source_time_key or bad_time_key. Defaults to keeping the existing value.
+
+This happens e.g. when a record passes through more than one `time_cutoff` filter, in which case the existing value is the true original time. The event time itself is replaced with current time in any case.
+
+* `skip`: keep the existing value.
+* `warn`: keep the existing value and log a warning to Fluentd's own log.
+* `overwrite`: replace the existing value.
+
+Available values: skip, warn, overwrite
+
+Default value: `skip`.
 
 ## Copyright
 

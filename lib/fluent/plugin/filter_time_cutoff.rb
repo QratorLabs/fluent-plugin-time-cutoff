@@ -39,6 +39,17 @@ module Fluent
         :drop
       ].freeze
 
+      # Available actions for records that already have the key the original
+      # time should be put into (for :replace_timestamp action).
+      TIME_KEY_CONFLICT_ACTIONS = [
+        # Keep the existing value:
+        :skip,
+        # Keep the existing value and log a warning:
+        :warn,
+        # Replace the existing value:
+        :overwrite
+      ].freeze
+
       # strftime() format string for :iso8601 time format.
       TIME_ISO8601 = '%FT%T%:z'
 
@@ -79,6 +90,27 @@ module Fluent
       config_param :bad_time_log, :bool, default: true
       desc 'The key that will hold the original unparseable time (for :replace_timestamp action). Defaults to "source_time_raw".'
       config_param :bad_time_key, :string, default: 'source_time_raw'
+      desc 'The action that will be performed when the record already has source_time_key or bad_time_key. Defaults to keeping the existing value.'
+      config_param :time_key_conflict, :enum, list: TIME_KEY_CONFLICT_ACTIONS, default: :skip
+
+      def configure(conf)
+        super
+
+        %i[old_cutoff new_cutoff].each do |param|
+          # NOTE: Fluentd's :time type drops the sign of values with a unit
+          # (e.g. "-1h" is parsed as 3600), so the raw value is checked too.
+          raw = conf[param.to_s].to_s.strip
+          next unless raw.start_with?('-') || instance_variable_get("@#{param}").negative?
+
+          raise Fluent::ConfigError, "#{param} must not be negative, got \"#{raw}\""
+        end
+        %i[source_time_key bad_time_key].each do |param|
+          raise Fluent::ConfigError, "#{param} must not be empty" if instance_variable_get("@#{param}").empty?
+        end
+        return unless @source_time_key == @bad_time_key
+
+        raise Fluent::ConfigError, "source_time_key and bad_time_key must differ, both are \"#{@source_time_key}\""
+      end
 
       def filter_with_time(tag, time, record)
         ## Safeguard against rogue integer/float/string time. This has to happen
@@ -91,12 +123,12 @@ module Fluent
         end
 
         event_time = time.to_i
-        current_time = Time.now.to_i
+        now = current_time
 
-        if event_time < current_time - @old_cutoff
+        if event_time < now - @old_cutoff
           # Too old
           process_old_record(tag, time, record)
-        elsif event_time > current_time + @new_cutoff
+        elsif event_time > now + @new_cutoff
           # Too new
           process_new_record(tag, time, record)
         else
@@ -106,6 +138,24 @@ module Fluent
       end
 
       private
+
+      # Current UNIX time, used as the reference point for the age check.
+      # Kept as a separate method so that tests can freeze the clock.
+      # @return [Integer] current time in seconds
+      def current_time
+        Time.now.to_i
+      end
+
+      # Format the event time as an ISO 8601 datetime string (in local time).
+      # NOTE: Time.at(int) is used instead of EventTime#to_time, which was
+      # only added to Fluentd in v1.8.0, and instead of Time.at(EventTime),
+      # which relies on Ruby coercing EventTime via #to_r/#to_int. EventTime#to_i
+      # is available in all Fluentd releases declared in the gemspec.
+      # @param time [Fluent::EventTime] the event time
+      # @return [String] ISO 8601-formatted datetime string
+      def iso8601(time)
+        Time.at(time.to_i).strftime(TIME_ISO8601)
+      end
 
       # Format the event time to a given type/format.
       # @param time [Fluent::EventTime] the original event time
@@ -118,25 +168,50 @@ module Fluent
         when :epoch_float
           time.to_f
         when :iso8601
-          # NOTE: Time.at(int) is used instead of EventTime#to_time, which was
-          # only added to Fluentd in v1.8.0. This keeps us compatible with the
-          # older Fluentd releases declared in the gemspec.
-          Time.at(time.to_i).strftime(TIME_ISO8601)
+          iso8601(time)
         end
       end
 
       # Replace event time and put the old time into a specified field.
+      # @param tag [String] log/stream's tag name
       # @param time [Fluent::EventTime] the original event time
       # @param record [Hash] the original record contents
       # @param @source_time_key [String] name of the field to put the old timestamp to.
       # @return [Array] new event time and a modified record.
-      def do_replace_timestamp(time, record)
-        new_time = Fluent::EventTime.now
-        new_record = record.dup
-        old_time = format_time(time)
-        new_record[@source_time_key] = old_time
+      def do_replace_timestamp(tag, time, record)
+        [Fluent::EventTime.now, put_time_key(tag, record, @source_time_key, format_time(time))]
+      end
 
-        [new_time, new_record]
+      # Put the original time into the given field of a copy of the record,
+      # unless the record already has that field and @time_key_conflict says
+      # to keep it. The original record is never modified.
+      # @param tag [String] log/stream's tag name
+      # @param record [Hash] the original record contents
+      # @param key [String] name of the field to put the time to
+      # @param value the time value to put into the field
+      # @return [Hash] the modified copy of the record, or the original record if kept as is
+      def put_time_key(tag, record, key, value)
+        if record.key?(key) && @time_key_conflict != :overwrite
+          log_time_key_conflict(tag, record, key, value) if @time_key_conflict == :warn
+          return record
+        end
+
+        new_record = record.dup
+        new_record[key] = value
+        new_record
+      end
+
+      # Log a time key conflict to Fluentd's log.
+      # @param tag [String] log/stream's tag name
+      # @param record [Hash] the original record contents
+      # @param key [String] name of the conflicting field
+      # @param value the time value that was not put into the field
+      def log_time_key_conflict(tag, record, key, value)
+        log_line = format(
+          'Record already has the "%<key>s" key, keeping its existing value instead of %<val>s: "%<tag>s: %<msg>s".',
+          key: key, val: value.inspect, tag: tag, msg: dump_record(record)
+        )
+        log.warn log_line
       end
 
       # Log the caught event to Fluentd's log.
@@ -146,10 +221,9 @@ module Fluent
       # @param action [Symbol] determined action for this record
       # @param age [Symbol] detemined age for this record (:old or :new)
       def log_record(tag, time, record, action, age)
-        fmt_time = Time.at(time).strftime(TIME_ISO8601)
         log_line = format(
           'Record caught [%<age>s, %<act>s]: "%<tag>s: %<time>s %<msg>s".',
-          age: age, act: action, tag: tag, time: fmt_time, msg: dump_record(record)
+          age: age, act: action, tag: tag, time: iso8601(time), msg: dump_record(record)
         )
         log.warn log_line
       end
@@ -240,7 +314,7 @@ module Fluent
         when :pass
           [time, record]
         when :replace_timestamp
-          do_replace_timestamp(time, record)
+          do_replace_timestamp(tag, time, record)
         when :drop
           nil
         end
@@ -256,7 +330,7 @@ module Fluent
 
         case @bad_time_action
         when :replace_timestamp
-          do_replace_bad_timestamp(time, record)
+          do_replace_bad_timestamp(tag, time, record)
         when :drop
           nil
         end
@@ -266,15 +340,14 @@ module Fluent
       # separate field. The raw time is always stored as a string, so that the
       # field keeps a stable type for downstream storage. It is not put into
       # @source_time_key, which holds a value in @source_time_format instead.
+      # @param tag [String] log/stream's tag name
       # @param time the original (unparseable) event time
       # @param record [Hash] the original record contents
       # @param @bad_time_key [String] name of the field to put the raw time to.
       # @return [Array] new event time and a modified record.
-      def do_replace_bad_timestamp(time, record)
-        new_record = record.dup
-        new_record[@bad_time_key] = time.is_a?(String) ? time : time.inspect
-
-        [Fluent::EventTime.now, new_record]
+      def do_replace_bad_timestamp(tag, time, record)
+        raw_time = time.is_a?(String) ? time : time.inspect
+        [Fluent::EventTime.now, put_time_key(tag, record, @bad_time_key, raw_time)]
       end
 
       # Process the "old" record according to the configuration
