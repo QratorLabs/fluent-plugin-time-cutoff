@@ -27,11 +27,10 @@ Gem::Specification.new do |spec|
   spec.require_paths = ['lib']
 
   spec.platform = Gem::Platform::RUBY
-  spec.required_ruby_version = Gem::Requirement.new('>= 2.3')
+  spec.required_ruby_version = Gem::Requirement.new('>= 2.7')
 
   spec.add_runtime_dependency 'fluentd', ['>= 0.14.10', '< 2']
 
-  spec.add_development_dependency 'bundler', '~> 2.6.3'
-  spec.add_development_dependency 'rake', '~> 13.1.0'
+  spec.add_development_dependency 'rake', '~> 13.2.0'
   spec.add_development_dependency 'test-unit', '~> 3.6.1'
 end
