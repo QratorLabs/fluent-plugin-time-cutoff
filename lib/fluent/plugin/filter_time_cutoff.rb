@@ -136,18 +136,12 @@ module Fluent
       end
 
       # Try to coerce an arbitrary value into a number, or return nil.
-      # Uses begin/rescue rather than the Integer()/Float() "exception:"
-      # keyword (Ruby 2.6+) so the plugin keeps working on older Rubies.
+      # Integer() is called with an explicit base 10 so that zero-padded
+      # strings (e.g. "01700000000") aren't parsed as octal.
       # @param value the value to coerce
       # @return [Integer,Float,nil] the parsed number, or nil if not numeric
       def coerce_to_number(value)
-        Integer(value)
-      rescue ArgumentError, TypeError
-        begin
-          Float(value)
-        rescue ArgumentError, TypeError
-          nil
-        end
+        Integer(value, 10, exception: false) || Float(value, exception: false)
       end
 
       # Process the record according to its determined "age"

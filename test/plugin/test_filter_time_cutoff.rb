@@ -156,6 +156,23 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
       assert_equal 1_700_000_000, result.sec
     end
 
+    test 'parses a zero-padded numeric string as decimal' do
+      result = @instance.send(:normalize_time, '01700000000')
+      assert_equal 1_700_000_000, result.sec
+    end
+
+    test 'parses a float string, keeping sub-second precision' do
+      result = @instance.send(:normalize_time, '1700000000.25')
+      assert_equal 1_700_000_000, result.sec
+      assert_in_delta 250_000_000, result.nsec, 1
+    end
+
+    test 'falls back to now for a nil value' do
+      result = @instance.send(:normalize_time, nil)
+      assert_kind_of Fluent::EventTime, result
+      assert_in_delta Time.now.to_i, result.sec, 5
+    end
+
     test 'falls back to now for a non-numeric value' do
       result = @instance.send(:normalize_time, 'not-a-time')
       assert_kind_of Fluent::EventTime, result
