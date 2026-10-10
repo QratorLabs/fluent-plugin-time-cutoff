@@ -98,6 +98,26 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
     end
   end
 
+  sub_test_case 'logging' do
+    test 'logs caught records as JSON' do
+      d = filter('old_action pass', ago(100_000))
+      assert_true(d.logs.any? { |l| l.include?('[old, pass]') && l.include?('{"message":"hello"}') })
+    end
+
+    test 'records that cannot be JSON-encoded are still processed' do
+      record = { 'message' => "\xFF".b }
+      d = filter('old_action pass', ago(100_000), record)
+      assert_empty d.error_events
+      assert_equal [record], d.filtered_records
+      assert_true(d.logs.any? { |l| l.include?('[old, pass]') && l.include?('\xFF') })
+    end
+
+    test 'logging is skipped when disabled' do
+      d = filter("old_action pass\nold_log false", ago(100_000))
+      assert_false(d.logs.any? { |l| l.include?('Record caught') })
+    end
+  end
+
   sub_test_case 'source_time_format' do
     test 'epoch stores an integer' do
       t = ago(100_000)

@@ -113,9 +113,20 @@ module Fluent
         fmt_time = Time.at(time).strftime(TIME_ISO8601)
         log_line = format(
           'Record caught [%<age>s, %<act>s]: "%<tag>s: %<time>s %<msg>s".',
-          age: age, act: action, tag: tag, time: fmt_time, msg: record.to_json
+          age: age, act: action, tag: tag, time: fmt_time, msg: dump_record(record)
         )
         log.warn log_line
+      end
+
+      # Serialize the record for logging. Falls back to #inspect when the
+      # record can't be represented as JSON (e.g. invalid UTF-8 or NaN), so
+      # that a logging failure never affects how the record is processed.
+      # @param record [Hash] the original record contents
+      # @return [String] the record as a JSON string, or its #inspect output
+      def dump_record(record)
+        record.to_json
+      rescue JSON::GeneratorError, EncodingError
+        record.inspect
       end
 
       # Normalize time to Fluent::EventTime if it's plain int or float.
