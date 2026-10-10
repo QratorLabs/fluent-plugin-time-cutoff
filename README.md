@@ -172,5 +172,5 @@ Default value: `iso8601`.
 
 ## Copyright
 
-* Copyright(c) 2025 Qrator Labs and Serge Tkatchouk
+* Copyright(c) 2025-2026 Qrator Labs and Serge Tkatchouk
 * License: MIT
