@@ -31,8 +31,29 @@ module Fluent
         :iso8601
       ].freeze
 
+      # Available actions for records with an unparseable time.
+      BAD_TIME_ACTIONS = [
+        # Replace time with "now" and pass:
+        :replace_timestamp,
+        # Drop record as invalid:
+        :drop
+      ].freeze
+
       # strftime() format string for :iso8601 time format.
       TIME_ISO8601 = '%FT%T%:z'
+
+      # Matches a "relaxed" ISO 8601 datetime string, which uses a space
+      # instead of "T" between the date and the time and/or has a space
+      # before the timezone (e.g. Ruby's Time#to_s: "2026-10-10 03:57:04 +0300"
+      # or "2026-10-10 00:57:04 UTC"), so that it can be rebuilt as a strict one.
+      ISO8601_RELAXED = /
+        \A
+        (?<date>\d{4}-\d{2}-\d{2})
+        [T\ ]
+        (?<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)
+        (?:\ ?(?<zone>Z|UTC|[+-]\d{2}(?::?\d{2})?))?
+        \z
+      /x.freeze
 
       Fluent::Plugin.register_filter('time_cutoff', self)
 
@@ -52,11 +73,22 @@ module Fluent
       config_param :source_time_key, :string, default: 'source_time'
       desc 'Time format for the original timestamp field. Defaults to ISO8601-formatted string.'
       config_param :source_time_format, :enum, list: TIME_FORMATS, default: :iso8601
+      desc 'The action that will be performed to all messages with an unparseable time. Defaults to replacing it with current time.'
+      config_param :bad_time_action, :enum, list: BAD_TIME_ACTIONS, default: :replace_timestamp
+      desc 'Log the messages with an unparseable time to Fluentd\'s own log. Defaults to "true".'
+      config_param :bad_time_log, :bool, default: true
+      desc 'The key that will hold the original unparseable time (for :replace_timestamp action). Defaults to "source_time_raw".'
+      config_param :bad_time_key, :string, default: 'source_time_raw'
 
       def filter_with_time(tag, time, record)
         ## Safeguard against rogue integer/float/string time. This has to happen
         ## before classification, so that the age check uses the parsed value.
-        time = normalize_time(time) unless time.is_a?(Fluent::EventTime)
+        unless time.is_a?(Fluent::EventTime)
+          normalized = normalize_time(time)
+          return process_bad_time_record(tag, time, record) if normalized.nil?
+
+          time = normalized
+        end
 
         event_time = time.to_i
         current_time = Time.now.to_i
@@ -122,6 +154,19 @@ module Fluent
         log.warn log_line
       end
 
+      # Log the caught event with an unparseable time to Fluentd's log.
+      # @param tag [String] log/stream's tag name
+      # @param time the original (unparseable) event time
+      # @param record [Hash] the original record contents
+      # @param action [Symbol] determined action for this record
+      def log_bad_time_record(tag, time, record, action)
+        log_line = format(
+          'Record caught [unparseable, %<act>s]: "%<tag>s: %<time>s %<msg>s".',
+          act: action, tag: tag, time: time.inspect, msg: dump_record(record)
+        )
+        log.warn log_line
+      end
+
       # Serialize the record for logging. Falls back to #inspect when the
       # record can't be represented as JSON (e.g. invalid UTF-8 or NaN), so
       # that a logging failure never affects how the record is processed.
@@ -133,9 +178,10 @@ module Fluent
         record.inspect
       end
 
-      # Normalize time to Fluent::EventTime if it's plain int or float.
-      # @param time [Integer|Float] incoming event time
-      # @return [Fluent::EventTime] event time normalized to Fluentd's internal format
+      # Normalize time to Fluent::EventTime if it's plain int or float, a
+      # numeric string or an ISO 8601 datetime string.
+      # @param time [Integer|Float|String] incoming event time
+      # @return [Fluent::EventTime,nil] event time normalized to Fluentd's internal format, or nil if unparseable
       def normalize_time(time)
         case time
         when Integer
@@ -144,9 +190,11 @@ module Fluent
           time_int, time_frac = time.divmod(1)
           Fluent::EventTime.new(time_int, (time_frac * 10**9).to_i)
         else
-          log.warn "Unknown time format given (#{time.class}): \"#{time.inspect}\"."
-          numeric = coerce_to_number(time)
-          numeric ? normalize_time(numeric) : Fluent::EventTime.now
+          if (numeric = coerce_to_number(time))
+            normalize_time(numeric)
+          elsif (parsed = parse_iso8601(time))
+            Fluent::EventTime.new(parsed.to_i, parsed.nsec)
+          end
         end
       end
 
@@ -157,6 +205,25 @@ module Fluent
       # @return [Integer,Float,nil] the parsed number, or nil if not numeric
       def coerce_to_number(value)
         Integer(value, 10, exception: false) || Float(value, exception: false)
+      end
+
+      # Try to parse a strict ISO 8601 datetime string, or return nil.
+      # Time.iso8601 is used instead of the lenient Time.parse, which would
+      # happily turn partial or ambiguous strings into a wrong timestamp.
+      # "Relaxed" strings (see ISO8601_RELAXED) are rebuilt as strict ones
+      # before parsing. Strings without a UTC offset are treated as local time.
+      # @param value the value to parse
+      # @return [Time,nil] the parsed time, or nil if not an ISO 8601 string
+      def parse_iso8601(value)
+        return nil unless value.is_a?(String)
+
+        if (match = ISO8601_RELAXED.match(value))
+          zone = match[:zone] == 'UTC' ? 'Z' : match[:zone]
+          value = "#{match[:date]}T#{match[:time]}#{zone}"
+        end
+        Time.iso8601(value)
+      rescue ArgumentError
+        nil
       end
 
       # Process the record according to its determined "age"
@@ -177,6 +244,37 @@ module Fluent
         when :drop
           nil
         end
+      end
+
+      # Process the record with an unparseable time according to the configuration
+      # @param tag [String] log/stream's tag name
+      # @param time the original (unparseable) event time
+      # @param record [Hash] the original record contents
+      # @return [Array,nil] current time and the record, or nil if dropped.
+      def process_bad_time_record(tag, time, record)
+        log_bad_time_record(tag, time, record, @bad_time_action) if @bad_time_log
+
+        case @bad_time_action
+        when :replace_timestamp
+          do_replace_bad_timestamp(time, record)
+        when :drop
+          nil
+        end
+      end
+
+      # Replace unparseable event time and put the raw original time into a
+      # separate field. The raw time is always stored as a string, so that the
+      # field keeps a stable type for downstream storage. It is not put into
+      # @source_time_key, which holds a value in @source_time_format instead.
+      # @param time the original (unparseable) event time
+      # @param record [Hash] the original record contents
+      # @param @bad_time_key [String] name of the field to put the raw time to.
+      # @return [Array] new event time and a modified record.
+      def do_replace_bad_timestamp(time, record)
+        new_record = record.dup
+        new_record[@bad_time_key] = time.is_a?(String) ? time : time.inspect
+
+        [Fluent::EventTime.now, new_record]
       end
 
       # Process the "old" record according to the configuration

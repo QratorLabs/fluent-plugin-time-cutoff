@@ -112,6 +112,10 @@ $ bundle
 
   source_time_key source_time
   source_time_format iso8601
+
+  bad_time_action replace_timestamp
+  bad_time_log true
+  bad_time_key source_time_raw
 </filter>
 
 ```
@@ -169,6 +173,30 @@ Time format for the original timestamp field. Defaults to ISO8601-formatted stri
 Available values: epoch, epoch_float, iso8601
 
 Default value: `iso8601`.
+
+### bad_time_action (enum) (optional)
+
+The action that will be performed to all messages with an unparseable time. Defaults to replacing it with current time.
+
+Event times that aren't a `Fluent::EventTime` are parsed before the age check. Integers, floats, numeric strings and ISO 8601 datetime strings are accepted. ISO 8601 strings may use a space instead of `T` and may have a space before the timezone (e.g. `2025-04-08 14:43:14 +0300` or `2025-04-08 11:43:14 UTC`, as produced by Ruby's `Time#to_s`). Strings without a timezone are treated as local time. Any other time is deemed unparseable and is handled according to this action (and logged, unless `bad_time_log` is disabled).
+
+Available values: replace_timestamp, drop
+
+Default value: `replace_timestamp`.
+
+### bad_time_log (bool) (optional)
+
+Log the messages with an unparseable time to Fluentd's own log. Defaults to "true".
+
+Default value: `true`.
+
+### bad_time_key (string) (optional)
+
+The key that will hold the original unparseable time (for :replace_timestamp action). Defaults to "source_time_raw".
+
+The original time is stored as is if it's a string, or as its Ruby `#inspect` representation otherwise (e.g. `nil`), so this field always holds a string. It is kept separate from `source_time_key`, so that `source_time_key` always holds a value in `source_time_format` and doesn't cause type conflicts in downstream storage.
+
+Default value: `source_time_raw`.
 
 ## Copyright
 
