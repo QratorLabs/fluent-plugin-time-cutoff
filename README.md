@@ -118,6 +118,8 @@ $ bundle
   bad_time_key source_time_raw
 
   time_key_conflict skip
+
+  metrics false
 </filter>
 
 ```
@@ -234,6 +236,14 @@ Available values: skip, warn, overwrite
 
 Default value: `skip`.
 
+### metrics (bool) (optional)
+
+Count caught records in a Prometheus counter (needs the prometheus-client gem). Defaults to "false".
+
+See [Metrics](#metrics) for details.
+
+Default value: `false`.
+
 ## Logging
 
 Each caught record is logged as a warning to Fluentd's own log, according to the `old_log`, `new_log` or `bad_time_log` mode:
@@ -251,6 +261,44 @@ Each caught record is logged as a warning to Fluentd's own log, according to the
 # full
 [warn]: [time_cutoff] Record caught [old, drop]: "vault.audit: 2025-04-07T14:43:24+03:00 {"message":"hello"}".
 [warn]: [time_cutoff] Record caught [bad_time, drop]: "vault.audit: "not-a-time" {"message":"hello"}".
+```
+
+## Metrics
+
+With `metrics true`, caught records are counted in a Prometheus counter:
+
+```
+fluentd_time_cutoff_records_total{plugin_id, worker_id, hostname, tag, reason, action}
+```
+
+* `plugin_id`: the filter's `@id`. Give each `time_cutoff` filter a stable `@id` to tell them apart.
+* `worker_id`, `hostname`: the Fluentd worker and host, so that series from multiple workers (e.g. on fluent-plugin-prometheus's `/aggregated_metrics` endpoint) and hosts don't collide.
+* `tag`: the record's tag.
+* `reason`: why the record was caught: `old`, `new` or `bad_time`.
+* `action`: what was done to it: `pass`, `replace_timestamp` or `drop`.
+
+Records inside the time window aren't counted. Records are counted regardless of their log mode, so the counter can replace per-record logging.
+
+The counter is registered in the default registry of the [prometheus-client](https://github.com/prometheus/client_ruby) gem (version 2.1 or newer), which is what [fluent-plugin-prometheus](https://github.com/fluent/fluent-plugin-prometheus) serves, so adding its `prometheus` input is enough to expose it:
+
+``` xml
+<source>
+  @type prometheus
+</source>
+
+<filter **>
+  @type time_cutoff
+  @id cutoff_main
+  metrics true
+</filter>
+```
+
+The prometheus-client gem is an optional dependency of this plugin. If it's not installed, enabling `metrics` only logs a warning on startup. Errors while updating the counter are logged once and never affect how records are processed.
+
+Example query, records dropped per second for being too old, by tag:
+
+```
+sum by (tag) (rate(fluentd_time_cutoff_records_total{reason="old", action="drop"}[5m]))
 ```
 
 ## Copyright

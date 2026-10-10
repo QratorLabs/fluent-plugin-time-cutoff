@@ -29,6 +29,7 @@ Gem::Specification.new do |spec|
 
   spec.add_runtime_dependency 'fluentd', ['>= 0.14.10', '< 2']
 
+  spec.add_development_dependency 'prometheus-client', '>= 2.1', '< 6'
   spec.add_development_dependency 'rake', '~> 13.2.0'
   spec.add_development_dependency 'test-unit', '~> 3.6.1'
 end

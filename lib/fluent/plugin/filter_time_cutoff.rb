@@ -2,6 +2,7 @@
 
 require 'fluent/plugin/filter'
 require 'json'
+require 'socket'
 require 'time'
 
 module Fluent
@@ -69,6 +70,10 @@ module Fluent
       # Log modes the boolean aliases stand for.
       LOG_MODE_ALIASES = { false: :none, no: :none, true: :full, yes: :full }.freeze
 
+      # Name and label names of the Prometheus counter for caught records.
+      METRIC_NAME = :fluentd_time_cutoff_records_total
+      METRIC_LABELS = %i[plugin_id worker_id hostname tag reason action].freeze
+
       # strftime() format string for :iso8601 time format.
       TIME_ISO8601 = '%FT%T%:z'
 
@@ -111,6 +116,8 @@ module Fluent
       config_param :bad_time_key, :string, default: 'source_time_raw'
       desc 'The action that will be performed when the record already has source_time_key or bad_time_key. Defaults to keeping the existing value.'
       config_param :time_key_conflict, :enum, list: TIME_KEY_CONFLICT_ACTIONS, default: :skip
+      desc 'Count caught records in a Prometheus counter (needs the prometheus-client gem). Defaults to "false".'
+      config_param :metrics, :bool, default: false
 
       def configure(conf)
         super
@@ -135,6 +142,7 @@ module Fluent
           instance_variable_set("@#{param}", LOG_MODE_ALIASES.fetch(mode, mode))
         end
 
+        setup_metrics
       end
 
       def filter_with_time(tag, time, record)
@@ -163,6 +171,67 @@ module Fluent
       end
 
       private
+
+      # Set up the Prometheus counter for caught records, if enabled. The
+      # counter is shared by all time_cutoff filters in the process.
+      def setup_metrics
+        return unless @metrics
+
+        unless load_prometheus_client
+          log.warn 'Metrics are enabled, but the prometheus-client gem is not installed, so caught records will not be counted.'
+          return
+        end
+
+        registry = prometheus_registry
+        @records_counter = registry.get(METRIC_NAME) || registry.counter(
+          METRIC_NAME,
+          docstring: 'Number of records caught by the time_cutoff filter.',
+          labels: METRIC_LABELS
+        )
+        @metric_labels = { plugin_id: plugin_id, worker_id: worker_id.to_s, hostname: Socket.gethostname }
+      end
+
+      # Load the prometheus-client gem, which is an optional dependency.
+      # @return [Boolean] whether the gem could be loaded
+      def load_prometheus_client
+        require 'prometheus/client'
+        true
+      rescue LoadError
+        false
+      end
+
+      # The Prometheus registry to register the counter in. This is the one
+      # fluent-plugin-prometheus serves on its /metrics endpoints.
+      def prometheus_registry
+        ::Prometheus::Client.registry
+      end
+
+      # ID of the Fluentd worker this plugin runs in.
+      # NOTE: Plugin::Base#fluentd_worker_id isn't available in the oldest
+      # Fluentd releases declared in the gemspec, so fall back to the env var
+      # it reads.
+      # @return [Integer] worker ID
+      def worker_id
+        return fluentd_worker_id if respond_to?(:fluentd_worker_id, true)
+
+        (ENV['SERVERENGINE_WORKER_ID'] || 0).to_i
+      end
+
+      # Count a caught record. Errors are logged once and never affect how
+      # the record is processed.
+      # @param tag [String] log/stream's tag name
+      # @param reason [Symbol] why the record was caught (:old, :new or :bad_time)
+      # @param action [Symbol] determined action for this record
+      def count_record(tag, reason, action)
+        return unless @records_counter
+
+        @records_counter.increment(labels: @metric_labels.merge(tag: tag, reason: reason.to_s, action: action.to_s))
+      rescue StandardError => e
+        return if @metrics_error_logged
+
+        @metrics_error_logged = true
+        log.warn "Failed to update metrics, further errors will not be logged: #{e.class}: #{e.message}"
+      end
 
       # Current UNIX time, used as the reference point for the age check.
       # Kept as a separate method so that tests can freeze the clock.

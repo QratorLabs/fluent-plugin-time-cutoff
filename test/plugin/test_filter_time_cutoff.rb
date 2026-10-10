@@ -1,4 +1,6 @@
 require 'helper'
+require 'prometheus/client'
+require 'socket'
 require 'fluent/plugin/filter_time_cutoff.rb'
 
 class TimeCutoffFilterTest < Test::Unit::TestCase
@@ -471,6 +473,92 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
     end
   end
 
+  sub_test_case 'metrics' do
+    METRIC = :fluentd_time_cutoff_records_total
+
+    def labels(reason, action, tag: 'test.cutoff', plugin_id: 'tc')
+      { plugin_id: plugin_id, worker_id: '0', hostname: Socket.gethostname,
+        tag: tag, reason: reason, action: action }
+    end
+
+    test 'nothing is registered unless enabled' do
+      registry = Prometheus::Client::Registry.new
+      metrics_filter("@id tc\nold_action drop", [[ago(100_000), RECORD]], registry: registry)
+      assert_nil registry.get(METRIC)
+    end
+
+    test 'counts caught records by reason and action' do
+      registry = Prometheus::Client::Registry.new
+      d = metrics_filter(
+        "@id tc\nmetrics true\nold_action drop\nnew_action replace_timestamp\nbad_time_action drop",
+        [[ago(100_000), RECORD], [ago(200_000), RECORD], [ahead(100_000), RECORD],
+         ['not-a-time', RECORD], [ago(60), RECORD]],
+        registry: registry
+      )
+      counter = registry.get(METRIC)
+      assert_equal 2.0, counter.get(labels: labels('old', 'drop'))
+      assert_equal 1.0, counter.get(labels: labels('new', 'replace_timestamp'))
+      assert_equal 1.0, counter.get(labels: labels('bad_time', 'drop'))
+      # Records inside the window aren't counted at all.
+      assert_equal 4.0, counter.values.values.sum
+      assert_equal 2, d.filtered.size
+    end
+
+    test 'counts records even when their log is disabled' do
+      registry = Prometheus::Client::Registry.new
+      metrics_filter("@id tc\nmetrics true\nold_action pass\nold_log none", [[ago(100_000), RECORD]],
+                     registry: registry)
+      assert_equal 1.0, registry.get(METRIC).get(labels: labels('old', 'pass'))
+    end
+
+    test 'labels records by tag and plugin_id' do
+      registry = Prometheus::Client::Registry.new
+      metrics_filter("@id high\nmetrics true\nold_action drop", [[ago(100_000), RECORD]],
+                     registry: registry, tag: 'vault.audit')
+      assert_equal 1.0, registry.get(METRIC).get(labels: labels('old', 'drop', tag: 'vault.audit', plugin_id: 'high'))
+    end
+
+    test 'several filters share one counter' do
+      registry = Prometheus::Client::Registry.new
+      metrics_filter("@id first\nmetrics true\nold_action drop", [[ago(100_000), RECORD]], registry: registry)
+      metrics_filter("@id second\nmetrics true\nold_action drop", [[ago(100_000), RECORD]], registry: registry)
+      counter = registry.get(METRIC)
+      assert_equal 1.0, counter.get(labels: labels('old', 'drop', plugin_id: 'first'))
+      assert_equal 1.0, counter.get(labels: labels('old', 'drop', plugin_id: 'second'))
+    end
+
+    test 'uses the worker id from the environment' do
+      registry = Prometheus::Client::Registry.new
+      begin
+        ENV['SERVERENGINE_WORKER_ID'] = '3'
+        metrics_filter("@id tc\nmetrics true\nold_action drop", [[ago(100_000), RECORD]], registry: registry)
+      ensure
+        ENV.delete('SERVERENGINE_WORKER_ID')
+      end
+      assert_equal 1.0, registry.get(METRIC).get(labels: labels('old', 'drop').merge(worker_id: '3'))
+    end
+
+    test 'warns once and keeps working without prometheus-client' do
+      d = Fluent::Test::Driver::Filter.new(Fluent::Plugin::TimeCutoffFilter)
+      d.instance.define_singleton_method(:load_prometheus_client) { false }
+      d.configure("metrics true\nold_action drop\nold_log none")
+      d.run(default_tag: 'test.cutoff') do
+        d.feed([[ago(100_000), RECORD], [ago(60), RECORD]])
+      end
+      assert_equal 1, d.filtered.size
+      assert_equal 1, d.logs.grep(/prometheus-client/).size
+    end
+
+    test 'a broken counter never affects record processing' do
+      registry = Prometheus::Client::Registry.new
+      # A metric with the same name but other labels makes every increment fail.
+      registry.counter(METRIC, docstring: 'conflicting', labels: [:foo])
+      d = metrics_filter("@id tc\nmetrics true\nold_action pass\nold_log none",
+                         [[ago(100_000), RECORD], [ago(200_000), RECORD]], registry: registry)
+      assert_equal 2, d.filtered.size
+      assert_empty d.error_events
+      assert_equal 1, d.logs.grep(/Failed to update metrics/).size
+    end
   end
 
   sub_test_case 'source_time_format' do
@@ -626,6 +714,18 @@ class TimeCutoffFilterTest < Test::Unit::TestCase
     d.instance.define_singleton_method(:current_time) { now } if now
     d.run(default_tag: 'test.cutoff') do
       d.feed([[time, record]])
+    end
+    d
+  end
+
+  # Feed several events through a driver whose Prometheus registry is
+  # replaced with the given one before configuration.
+  def metrics_filter(conf, events, registry:, tag: 'test.cutoff')
+    d = Fluent::Test::Driver::Filter.new(Fluent::Plugin::TimeCutoffFilter)
+    d.instance.define_singleton_method(:prometheus_registry) { registry }
+    d.configure(conf)
+    d.run(default_tag: tag) do
+      d.feed(events)
     end
     d
   end
